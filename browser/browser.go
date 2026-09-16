@@ -72,6 +72,11 @@ func NewBrowser(headless bool, options ...Option) *headless_browser.Browser {
 		// 注：hardware-concurrency 不设，交给 seed 派生。
 		headless_browser.WithExtraFlags(map[string]string{"fingerprint-brand": "Chrome"}),
 	}
+	// 固定窗口尺寸，降低 headless/headful 在布局与点击命中上的差异。
+	opts = append(opts, headless_browser.WithExtraFlags(map[string]string{
+		"window-size":               "1440,1080",
+		"force-device-scale-factor": "1",
+	}))
 	opts = append(opts, headless_browser.WithChromeBinPath(binPath))
 
 	// 代理（由调用方经 Option 传入，env 读取放在入口层）。

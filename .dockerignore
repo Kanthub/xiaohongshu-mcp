@@ -14,3 +14,5 @@ docker
 .DS_Store
 
 cookies.json
+data
+.cache

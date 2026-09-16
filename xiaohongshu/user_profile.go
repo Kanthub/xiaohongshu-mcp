@@ -64,33 +64,50 @@ func (u *UserProfileAction) UserProfile(ctx context.Context, userID, xsecToken s
 func (u *UserProfileAction) extractUserProfileData(page *rod.Page, tab ProfileTab) (*UserProfileResponse, error) {
 	page.MustWait(`() => window.__INITIAL_STATE__ !== undefined`)
 
-	userDataResult := page.MustEval(`() => {
-		if (window.__INITIAL_STATE__ &&
-		    window.__INITIAL_STATE__.user &&
-		    window.__INITIAL_STATE__.user.userPageData) {
-			const userPageData = window.__INITIAL_STATE__.user.userPageData;
-			const data = userPageData.value !== undefined ? userPageData.value : userPageData._value;
-			if (data) {
-				return JSON.stringify(data);
+	var userDataResult string
+	userDeadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(userDeadline) {
+		userDataResult = page.MustEval(`() => {
+			if (window.__INITIAL_STATE__ &&
+			    window.__INITIAL_STATE__.user &&
+			    window.__INITIAL_STATE__.user.userPageData) {
+				const userPageData = window.__INITIAL_STATE__.user.userPageData;
+				const data = userPageData.value !== undefined ? userPageData.value : userPageData._value;
+				if (data) {
+					return JSON.stringify(data);
+				}
 			}
+			return "";
+		}`).String()
+		if userDataResult != "" {
+			break
 		}
-		return "";
-	}`).String()
+		time.Sleep(300 * time.Millisecond)
+	}
 
 	if userDataResult == "" {
 		return nil, fmt.Errorf("user.userPageData.value not found in __INITIAL_STATE__")
 	}
 
 	// 2. 获取用户帖子及当前 tab：window.__INITIAL_STATE__.user
-	notesResult := page.MustEval(`() => {
-		const u = window.__INITIAL_STATE__ && window.__INITIAL_STATE__.user;
-		if (!u || !u.notes) return "";
-		const unwrap = (o) => (o && o.value !== undefined) ? o.value : (o && o._value);
-		const notes = unwrap(u.notes);
-		if (!notes) return "";
-		const active = unwrap(u.activeTab) || {};
-		return JSON.stringify({notes: notes, index: active.index || 0, query: active.query || ""});
-	}`).String()
+	// 主页数据是异步注入的；页面稳定不代表 user.notes 已经有内容。
+	var notesResult string
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		notesResult = page.MustEval(`() => {
+			const u = window.__INITIAL_STATE__ && window.__INITIAL_STATE__.user;
+			if (!u || !u.notes) return "";
+			const unwrap = (o) => (o && o.value !== undefined) ? o.value : (o && o._value);
+			const notes = unwrap(u.notes);
+			if (!notes) return "";
+			const active = unwrap(u.activeTab) || {};
+			return JSON.stringify({notes: notes, index: active.index || 0, query: active.query || ""});
+		}`).String()
+		if notesResult != "" {
+			break
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
 
 	if notesResult == "" {
 		return nil, fmt.Errorf("user.notes.value not found in __INITIAL_STATE__")
@@ -106,9 +123,9 @@ func (u *UserProfileAction) extractUserProfileData(page *rod.Page, tab ProfileTa
 	}
 
 	var notesData struct {
-		Notes [][]Feed `json:"notes"`
-		Index int      `json:"index"`
-		Query string   `json:"query"`
+		Notes json.RawMessage `json:"notes"`
+		Index int             `json:"index"`
+		Query string          `json:"query"`
 	}
 	if err := json.Unmarshal([]byte(notesResult), &notesData); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal notes: %w", err)
@@ -123,16 +140,30 @@ func (u *UserProfileAction) extractUserProfileData(page *rod.Page, tab ProfileTa
 		return nil, fmt.Errorf("当前 tab 为 %q，与请求的 %q 不符", notesData.Query, want)
 	}
 
+	// 主页版本不同的时候 notes 可能是二维数组，也可能已经是扁平数组。
+	// 两种结构都兼容，避免解析成功但最终 Feeds 为空。
+	var noteGroups [][]Feed
+	if err := json.Unmarshal(notesData.Notes, &noteGroups); err == nil {
+		if notesData.Index >= 0 && notesData.Index < len(noteGroups) {
+			responseFeeds := noteGroups[notesData.Index]
+			return &UserProfileResponse{
+				UserBasicInfo: userPageData.BasicInfo,
+				Interactions:  userPageData.Interactions,
+				Feeds:         responseFeeds,
+			}, nil
+		}
+	}
+	var flatNotes []Feed
+	if err := json.Unmarshal(notesData.Notes, &flatNotes); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal notes feeds: %w", err)
+	}
+
 	// 组装响应
 	response := &UserProfileResponse{
 		UserBasicInfo: userPageData.BasicInfo,
 		Interactions:  userPageData.Interactions,
 	}
-
-	// 每个 tab 的内容存在各自的下标里，只取当前 tab 的，避免混入其他 tab
-	if notesData.Index >= 0 && notesData.Index < len(notesData.Notes) {
-		response.Feeds = append(response.Feeds, notesData.Notes[notesData.Index]...)
-	}
+	response.Feeds = flatNotes
 
 	return response, nil
 }

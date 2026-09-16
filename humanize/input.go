@@ -101,6 +101,36 @@ func Click(elem *rod.Element) error {
 	return pressAndRelease(mouse)
 }
 
+// ClickWithTimeout 在有限时间内等待元素可交互；超时后返回错误，让调用方决定是否降级。
+func ClickWithTimeout(elem *rod.Element, timeout time.Duration) error {
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
+
+	pt, err := elem.Timeout(timeout).WaitInteractable()
+	if err != nil {
+		return err
+	}
+
+	target := jitterOn(elem, *pt)
+	if err := ensureClickable(elem, target); err != nil {
+		return err
+	}
+
+	mouse := elem.Page().Mouse
+	if err := moveMouseCurved(mouse, target); err != nil {
+		return err
+	}
+
+	Delay(elem.Page().GetContext(), PointerSettle)
+
+	if err := elem.Timeout(timeout).WaitEnabled(); err != nil {
+		return err
+	}
+
+	return pressAndRelease(mouse)
+}
+
 // ClickNoWait 跳过 WaitInteractable 的遮挡重试，用于它会误判而死等的场景。
 func ClickNoWait(elem *rod.Element) error {
 	shape, err := elem.Shape()

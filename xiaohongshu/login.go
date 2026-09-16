@@ -3,6 +3,7 @@ package xiaohongshu
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"time"
 
 	"github.com/go-rod/rod"
@@ -88,26 +89,51 @@ func (a *LoginAction) Login(ctx context.Context) error {
 }
 
 func (a *LoginAction) FetchQrcodeImage(ctx context.Context) (string, bool, error) {
-	pp := a.page.Context(ctx)
+	pp := a.page.Context(ctx).Timeout(30 * time.Second)
 
 	// 导航到小红书首页，这会触发二维码弹窗
-	pp.MustNavigate("https://www.xiaohongshu.com/explore").MustWaitLoad()
-
-	time.Sleep(2 * time.Second)
-
-	if exists, _, _ := pp.Has(".main-container .user .link-wrapper .channel"); exists {
-		return "", true, nil
+	if err := pp.Navigate("https://www.xiaohongshu.com/explore"); err != nil {
+		return "", false, errors.Wrap(err, "navigate to explore failed")
+	}
+	if err := pp.WaitLoad(); err != nil {
+		return "", false, errors.Wrap(err, "wait explore page failed")
 	}
 
-	src, err := pp.MustElement(".login-container .qrcode-img").Attribute("src")
-	if err != nil {
-		return "", false, errors.Wrap(err, "get qrcode src failed")
+	// 页面和二维码弹窗是异步加载的，不能只固定等待 2 秒。轮询期间同时检查
+	// 登录态，避免已登录时把“没有二维码”误报成失败。
+	selectors := []string{
+		".login-container .qrcode-img",
+		".login-container img[src^='data:image']",
+		"img.qrcode-img",
+		"img[class*='qrcode']",
 	}
-	if src == nil || len(*src) == 0 {
-		return "", false, errors.New("qrcode src is empty")
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		if exists, _, _ := pp.Has(".main-container .user .link-wrapper .channel"); exists {
+			return "", true, nil
+		}
+
+		for _, selector := range selectors {
+			elem, err := pp.Element(selector)
+			if err != nil || elem == nil {
+				continue
+			}
+			for _, attr := range []string{"src", "data-src"} {
+				src, err := elem.Attribute(attr)
+				if err == nil && src != nil && strings.TrimSpace(*src) != "" {
+					return *src, false, nil
+				}
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return "", false, ctx.Err()
+		case <-time.After(300 * time.Millisecond):
+		}
 	}
 
-	return *src, false, nil
+	return "", false, errors.New("qrcode image not found after waiting 15s; the login page may have changed or the request may be blocked")
 }
 
 func (a *LoginAction) WaitForLogin(ctx context.Context) bool {

@@ -1,0 +1,5 @@
+./browser.go
+./image.go
+./seed.go
+./browser_test.go
+./seed_test.go

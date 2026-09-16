@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/go-rod/rod"
@@ -56,10 +57,13 @@ type LoginQrcodeResponse struct {
 
 // PublishResponse 发布响应
 type PublishResponse struct {
-	Title   string `json:"title"`
-	Content string `json:"content"`
-	Images  int    `json:"images"`
-	Status  string `json:"status"`
+	Title     string `json:"title"`
+	Content   string `json:"content"`
+	Images    int    `json:"images"`
+	Status    string `json:"status"`
+	FeedID    string `json:"feed_id"`
+	XsecToken string `json:"xsec_token"`
+	Message   string `json:"message,omitempty"`
 }
 
 // PublishVideoRequest 发布视频请求（仅支持本地单个视频文件）
@@ -75,11 +79,16 @@ type PublishVideoRequest struct {
 
 // PublishVideoResponse 发布视频响应
 type PublishVideoResponse struct {
-	Title   string `json:"title"`
-	Content string `json:"content"`
-	Video   string `json:"video"`
-	Status  string `json:"status"`
+	Title     string `json:"title"`
+	Content   string `json:"content"`
+	Video     string `json:"video"`
+	Status    string `json:"status"`
+	FeedID    string `json:"feed_id"`
+	XsecToken string `json:"xsec_token"`
+	Message   string `json:"message,omitempty"`
 }
+
+const publishLookupPendingMessage = "发布成功，但暂未获取到 feed_id/xsec_token，请稍后调用 get_my_profile(tab=\"note\") 查询"
 
 // FeedsListResponse Feeds列表响应
 type FeedsListResponse struct {
@@ -249,6 +258,13 @@ func (s *XiaohongshuService) PublishContent(ctx context.Context, req *PublishReq
 		Products:     req.Products,
 	}
 
+	// 发布前记住已有笔记。发布后的标题可能被平台清洗，或与历史笔记重名，
+	// 因此不能只依赖标题判断“刚发布的那一条”。
+	var knownFeedIDs map[string]struct{}
+	if req.ScheduleAt == "" {
+		knownFeedIDs = s.currentFeedIDs(ctx)
+	}
+
 	if err := s.publishContent(ctx, content); err != nil {
 		logrus.Errorf("发布内容失败: title=%s %v", content.Title, err)
 		return nil, err
@@ -260,6 +276,7 @@ func (s *XiaohongshuService) PublishContent(ctx context.Context, req *PublishReq
 		Images:  len(imagePaths),
 		Status:  "发布完成",
 	}
+	s.enrichPublishedFeed(ctx, req.Title, req.ScheduleAt, knownFeedIDs, &response.FeedID, &response.XsecToken, &response.Message)
 
 	return response, nil
 }
@@ -336,6 +353,11 @@ func (s *XiaohongshuService) PublishVideo(ctx context.Context, req *PublishVideo
 		Products:     req.Products,
 	}
 
+	var knownFeedIDs map[string]struct{}
+	if req.ScheduleAt == "" {
+		knownFeedIDs = s.currentFeedIDs(ctx)
+	}
+
 	if err := s.publishVideo(ctx, content); err != nil {
 		return nil, err
 	}
@@ -346,7 +368,100 @@ func (s *XiaohongshuService) PublishVideo(ctx context.Context, req *PublishVideo
 		Video:   req.Video,
 		Status:  "发布完成",
 	}
+	s.enrichPublishedFeed(ctx, req.Title, req.ScheduleAt, knownFeedIDs, &resp.FeedID, &resp.XsecToken, &resp.Message)
 	return resp, nil
+}
+
+// enrichPublishedFeed 在发布成功后从“我的笔记”中查找刚发布的内容。
+// 查询失败属于附加信息缺失，不影响已经完成的发布结果。
+func (s *XiaohongshuService) enrichPublishedFeed(ctx context.Context, title, scheduleAt string, knownFeedIDs map[string]struct{}, feedID, xsecToken, message *string) {
+	if scheduleAt != "" {
+		*message = publishLookupPendingMessage
+		return
+	}
+
+	// 创作者中心发布成功后，个人主页的笔记列表通常还要几秒才会刷新。
+	// 只尝试 3 次很容易在索引尚未完成时返回空的 feed_id/xsec_token。
+	const attempts = 8
+	for attempt := 1; attempt <= attempts; attempt++ {
+		profile, err := s.GetMyProfile(ctx, string(xiaohongshu.TabNotes))
+		if err == nil {
+			if feed, ok := findPublishedFeed(profile.Feeds, title, knownFeedIDs); ok {
+				*feedID = feed.ID
+				*xsecToken = feed.XsecToken
+				return
+			}
+			logrus.Warnf("发布成功后主页暂未找到匹配笔记（第 %d/%d 次，标题=%q，笔记数=%d）", attempt, attempts, title, len(profile.Feeds))
+		} else {
+			logrus.Warnf("发布成功后查询笔记信息失败（第 %d/%d 次）: %v", attempt, attempts, err)
+		}
+
+		if attempt < attempts {
+			select {
+			case <-ctx.Done():
+				*message = publishLookupPendingMessage
+				return
+			case <-time.After(2 * time.Second):
+			}
+		}
+	}
+
+	*message = publishLookupPendingMessage
+}
+
+// findPublishedFeed 优先选择新增且标题匹配的笔记；有发布前快照时再用新增项兜底。
+// 主页通常按发布时间倒序排列，因此多个新增项中优先命中最新一条。
+func findPublishedFeed(feeds []xiaohongshu.Feed, title string, knownFeedIDsArg ...map[string]struct{}) (xiaohongshu.Feed, bool) {
+	var knownFeedIDs map[string]struct{}
+	if len(knownFeedIDsArg) > 0 {
+		knownFeedIDs = knownFeedIDsArg[0]
+	}
+	normalizedTitle := normalizeFeedTitle(title)
+	var firstNewFeed *xiaohongshu.Feed
+	for _, feed := range feeds {
+		if feed.ID == "" || feed.XsecToken == "" {
+			continue
+		}
+		_, existedBeforePublish := knownFeedIDs[feed.ID]
+		if !existedBeforePublish && normalizeFeedTitle(feed.NoteCard.DisplayTitle) == normalizedTitle {
+			return feed, true
+		}
+		if !existedBeforePublish && firstNewFeed == nil {
+			feedCopy := feed
+			firstNewFeed = &feedCopy
+		}
+	}
+
+	// 有发布前快照时，若标题在平台侧被自动改写，仍可通过“新增的最新一条”
+	// 找回真实标识。没有快照时不能采用这个兜底，以免错把旧笔记当作新笔记。
+	if knownFeedIDs != nil && firstNewFeed != nil {
+		return *firstNewFeed, true
+	}
+	return xiaohongshu.Feed{}, false
+}
+
+// currentFeedIDs 读取发布前已有的笔记 ID。查询失败不阻断发布，后续仍按标题查找。
+func (s *XiaohongshuService) currentFeedIDs(ctx context.Context) map[string]struct{} {
+	// 这是发布前的辅助查询，不能因为主页暂时不可用而长期阻塞真正的发布动作。
+	lookupCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	profile, err := s.GetMyProfile(lookupCtx, string(xiaohongshu.TabNotes))
+	if err != nil {
+		logrus.Warnf("发布前读取已有笔记失败，发布后将仅按标题匹配: %v", err)
+		return nil
+	}
+
+	ids := make(map[string]struct{}, len(profile.Feeds))
+	for _, feed := range profile.Feeds {
+		if feed.ID != "" {
+			ids[feed.ID] = struct{}{}
+		}
+	}
+	return ids
+}
+
+func normalizeFeedTitle(title string) string {
+	return strings.Join(strings.Fields(strings.TrimSpace(title)), " ")
 }
 
 // publishVideo 执行视频发布

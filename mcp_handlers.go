@@ -179,13 +179,7 @@ func (s *AppServer) handlePublishContent(ctx context.Context, args map[string]in
 		}
 	}
 
-	resultText := fmt.Sprintf("内容发布成功: %+v", result)
-	return &MCPToolResult{
-		Content: []MCPContent{{
-			Type: "text",
-			Text: resultText,
-		}},
-	}
+	return marshalMCPResult(result, "内容发布")
 }
 
 // handlePublishVideo 处理发布视频内容（仅本地单个视频文件）
@@ -248,13 +242,7 @@ func (s *AppServer) handlePublishVideo(ctx context.Context, args map[string]inte
 		}
 	}
 
-	resultText := fmt.Sprintf("视频发布成功: %+v", result)
-	return &MCPToolResult{
-		Content: []MCPContent{{
-			Type: "text",
-			Text: resultText,
-		}},
-	}
+	return marshalMCPResult(result, "视频发布")
 }
 
 // handleListFeeds 处理获取Feeds列表

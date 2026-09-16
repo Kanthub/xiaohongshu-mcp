@@ -588,8 +588,11 @@ func clickPublishWidget(page *rod.Page, widget *rod.Element) error {
 func waitAndClickTitleInput(titleElem *rod.Element) error {
 	slog.Info("正文填写完成，准备等待后回点标题输入框")
 	time.Sleep(1 * time.Second)
-	if err := humanize.Click(titleElem); err != nil {
-		return errors.Wrap(err, "回点标题输入框失败")
+	if err := humanize.ClickWithTimeout(titleElem, 5*time.Second); err != nil {
+		slog.Warn("回点标题输入框首次点击失败，尝试降级点击", "error", err)
+		if err2 := humanize.ClickNoWait(titleElem); err2 != nil {
+			return errors.Wrap(err2, "回点标题输入框失败")
+		}
 	}
 	slog.Info("已回点标题输入框，继续后续发布流程")
 	return nil
