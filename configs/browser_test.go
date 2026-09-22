@@ -29,6 +29,9 @@ func TestFingerprintSeedFromEnv(t *testing.T) {
 }
 
 func TestProxyFromEnv(t *testing.T) {
+	for _, key := range []string{"XHS_PROXY", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"} {
+		t.Setenv(key, "")
+	}
 	t.Run("未设为空", func(t *testing.T) {
 		t.Setenv("XHS_PROXY", "")
 		assert.Equal(t, "", ProxyFromEnv())
@@ -37,4 +40,16 @@ func TestProxyFromEnv(t *testing.T) {
 		t.Setenv("XHS_PROXY", "socks5://127.0.0.1:1080")
 		assert.Equal(t, "socks5://127.0.0.1:1080", ProxyFromEnv())
 	})
+}
+
+func TestProxyFromStandardEnvFallback(t *testing.T) {
+	for _, key := range []string{"XHS_PROXY", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"} {
+		t.Setenv(key, "")
+	}
+
+	t.Setenv("HTTPS_PROXY", "http://standard.example:8080")
+	assert.Equal(t, "http://standard.example:8080", ProxyFromEnv())
+
+	t.Setenv("XHS_PROXY", "http://xhs.example:8081")
+	assert.Equal(t, "http://xhs.example:8081", ProxyFromEnv())
 }

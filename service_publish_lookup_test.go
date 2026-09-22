@@ -1,12 +1,35 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/xpzouying/xiaohongshu-mcp/xiaohongshu"
 )
+
+func TestBestEffortProfileLookupConvertsPanicToError(t *testing.T) {
+	profile, err := bestEffortProfileLookup(context.Background(), time.Second, func(context.Context) (*UserProfileResponse, error) {
+		panic(context.DeadlineExceeded)
+	})
+
+	require.Error(t, err)
+	assert.Nil(t, profile)
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+}
+
+func TestBestEffortProfileLookupReturnsOrdinaryError(t *testing.T) {
+	want := errors.New("profile unavailable")
+	profile, err := bestEffortProfileLookup(context.Background(), time.Second, func(context.Context) (*UserProfileResponse, error) {
+		return nil, want
+	})
+
+	assert.Nil(t, profile)
+	assert.ErrorIs(t, err, want)
+}
 
 func TestFindPublishedFeed(t *testing.T) {
 	feeds := []xiaohongshu.Feed{

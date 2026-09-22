@@ -90,6 +90,14 @@ type PublishVideoResponse struct {
 
 const publishLookupPendingMessage = "发布成功，但暂未获取到 feed_id/xsec_token，请稍后调用 get_my_profile(tab=\"note\") 查询"
 
+// publishFeedLookupTimeout keeps profile reads strictly auxiliary. The profile
+// page is independently rendered by Xiaohongshu and can be slow or temporarily
+// unavailable; it must never consume the publish operation's deadline.
+const (
+	publishPreflightLookupTimeout = 5 * time.Second
+	publishResultLookupTimeout    = 25 * time.Second
+)
+
 // FeedsListResponse Feeds列表响应
 type FeedsListResponse struct {
 	Feeds []xiaohongshu.Feed `json:"feeds"`
@@ -382,9 +390,11 @@ func (s *XiaohongshuService) enrichPublishedFeed(ctx context.Context, title, sch
 
 	// 创作者中心发布成功后，个人主页的笔记列表通常还要几秒才会刷新。
 	// 只尝试 3 次很容易在索引尚未完成时返回空的 feed_id/xsec_token。
-	const attempts = 8
+	const attempts = 4
 	for attempt := 1; attempt <= attempts; attempt++ {
-		profile, err := s.GetMyProfile(ctx, string(xiaohongshu.TabNotes))
+		profile, err := bestEffortProfileLookup(ctx, publishResultLookupTimeout, func(lookupCtx context.Context) (*UserProfileResponse, error) {
+			return s.GetMyProfile(lookupCtx, string(xiaohongshu.TabNotes))
+		})
 		if err == nil {
 			if feed, ok := findPublishedFeed(profile.Feeds, title, knownFeedIDs); ok {
 				*feedID = feed.ID
@@ -442,10 +452,9 @@ func findPublishedFeed(feeds []xiaohongshu.Feed, title string, knownFeedIDsArg .
 
 // currentFeedIDs 读取发布前已有的笔记 ID。查询失败不阻断发布，后续仍按标题查找。
 func (s *XiaohongshuService) currentFeedIDs(ctx context.Context) map[string]struct{} {
-	// 这是发布前的辅助查询，不能因为主页暂时不可用而长期阻塞真正的发布动作。
-	lookupCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
-	defer cancel()
-	profile, err := s.GetMyProfile(lookupCtx, string(xiaohongshu.TabNotes))
+	profile, err := bestEffortProfileLookup(ctx, publishPreflightLookupTimeout, func(lookupCtx context.Context) (*UserProfileResponse, error) {
+		return s.GetMyProfile(lookupCtx, string(xiaohongshu.TabNotes))
+	})
 	if err != nil {
 		logrus.Warnf("发布前读取已有笔记失败，发布后将仅按标题匹配: %v", err)
 		return nil
@@ -458,6 +467,36 @@ func (s *XiaohongshuService) currentFeedIDs(ctx context.Context) map[string]stru
 		}
 	}
 	return ids
+}
+
+// bestEffortProfileLookup converts Rod's Must* panics into ordinary errors and
+// gives the lookup a short, isolated deadline. context.WithoutCancel preserves
+// trace/request values while preventing a failed optional lookup from
+// cancelling the subsequent irreversible publish operation.
+func bestEffortProfileLookup(parent context.Context, timeout time.Duration, lookup func(context.Context) (*UserProfileResponse, error)) (profile *UserProfileResponse, err error) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	if err := parent.Err(); err != nil {
+		return nil, err
+	}
+	if timeout <= 0 {
+		timeout = publishPreflightLookupTimeout
+	}
+	lookupCtx, cancel := context.WithTimeout(context.WithoutCancel(parent), timeout)
+	defer cancel()
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			switch cause := recovered.(type) {
+			case error:
+				err = fmt.Errorf("profile lookup failed: %w", cause)
+			default:
+				err = fmt.Errorf("profile lookup failed: %v", cause)
+			}
+			profile = nil
+		}
+	}()
+	return lookup(lookupCtx)
 }
 
 func normalizeFeedTitle(title string) string {

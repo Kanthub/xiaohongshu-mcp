@@ -3,6 +3,7 @@ package configs
 import (
 	"os"
 	"strconv"
+	"strings"
 
 	"github.com/sirupsen/logrus"
 )
@@ -55,7 +56,19 @@ func Proxy() string {
 	return proxy
 }
 
-// ProxyFromEnv 从 XHS_PROXY 环境变量读取代理地址。env 读取集中在配置层。
+// ProxyFromEnv 优先读取 XHS_PROXY，并回退到标准 HTTP(S)/ALL_PROXY 环境变量。
 func ProxyFromEnv() string {
-	return os.Getenv("XHS_PROXY")
+	for _, key := range []string{
+		"XHS_PROXY",
+		"HTTPS_PROXY", "https_proxy",
+		"HTTP_PROXY", "http_proxy",
+		"ALL_PROXY", "all_proxy",
+	} {
+		if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+			// Log the selected variable name, never the credential-bearing value.
+			logrus.Infof("browser proxy configured from %s", key)
+			return value
+		}
+	}
+	return ""
 }

@@ -50,24 +50,32 @@ func NewUserProfileAction(page *rod.Page) *UserProfileAction {
 }
 
 // UserProfile 获取用户基本信息及指定 tab 下的帖子
-func (u *UserProfileAction) UserProfile(ctx context.Context, userID, xsecToken string, tab ProfileTab) (*UserProfileResponse, error) {
+func (u *UserProfileAction) UserProfile(ctx context.Context, userID, xsecToken string, tab ProfileTab) (response *UserProfileResponse, err error) {
+	defer recoverProfilePanic("load user profile", &err)
 	page := u.page.Context(ctx).Timeout(60 * time.Second) // 重设被 .Context 清掉的 deadline
 
 	searchURL := makeUserProfileURL(userID, xsecToken, tab)
-	page.MustNavigate(searchURL)
-	page.MustWaitStable()
+	if err := page.Navigate(searchURL); err != nil {
+		return nil, fmt.Errorf("navigate to user profile: %w", err)
+	}
+	if err := page.WaitStable(time.Second); err != nil {
+		return nil, fmt.Errorf("wait for user profile page: %w", err)
+	}
 
 	return u.extractUserProfileData(page, tab)
 }
 
 // extractUserProfileData 从页面中提取用户资料数据的通用方法
-func (u *UserProfileAction) extractUserProfileData(page *rod.Page, tab ProfileTab) (*UserProfileResponse, error) {
-	page.MustWait(`() => window.__INITIAL_STATE__ !== undefined`)
+func (u *UserProfileAction) extractUserProfileData(page *rod.Page, tab ProfileTab) (response *UserProfileResponse, err error) {
+	defer recoverProfilePanic("extract user profile", &err)
+	if err := waitForProfileInitialState(page, 10*time.Second); err != nil {
+		return nil, err
+	}
 
 	var userDataResult string
 	userDeadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(userDeadline) {
-		userDataResult = page.MustEval(`() => {
+		result, evalErr := page.Eval(`() => {
 			if (window.__INITIAL_STATE__ &&
 			    window.__INITIAL_STATE__.user &&
 			    window.__INITIAL_STATE__.user.userPageData) {
@@ -78,11 +86,16 @@ func (u *UserProfileAction) extractUserProfileData(page *rod.Page, tab ProfileTa
 				}
 			}
 			return "";
-		}`).String()
+		}`)
+		if evalErr == nil && result != nil {
+			userDataResult = result.Value.Str()
+		}
 		if userDataResult != "" {
 			break
 		}
-		time.Sleep(300 * time.Millisecond)
+		if err := waitProfilePoll(page, 300*time.Millisecond); err != nil {
+			return nil, err
+		}
 	}
 
 	if userDataResult == "" {
@@ -94,7 +107,7 @@ func (u *UserProfileAction) extractUserProfileData(page *rod.Page, tab ProfileTa
 	var notesResult string
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
-		notesResult = page.MustEval(`() => {
+		result, evalErr := page.Eval(`() => {
 			const u = window.__INITIAL_STATE__ && window.__INITIAL_STATE__.user;
 			if (!u || !u.notes) return "";
 			const unwrap = (o) => (o && o.value !== undefined) ? o.value : (o && o._value);
@@ -102,11 +115,16 @@ func (u *UserProfileAction) extractUserProfileData(page *rod.Page, tab ProfileTa
 			if (!notes) return "";
 			const active = unwrap(u.activeTab) || {};
 			return JSON.stringify({notes: notes, index: active.index || 0, query: active.query || ""});
-		}`).String()
+		}`)
+		if evalErr == nil && result != nil {
+			notesResult = result.Value.Str()
+		}
 		if notesResult != "" {
 			break
 		}
-		time.Sleep(300 * time.Millisecond)
+		if err := waitProfilePoll(page, 300*time.Millisecond); err != nil {
+			return nil, err
+		}
 	}
 
 	if notesResult == "" {
@@ -159,7 +177,7 @@ func (u *UserProfileAction) extractUserProfileData(page *rod.Page, tab ProfileTa
 	}
 
 	// 组装响应
-	response := &UserProfileResponse{
+	response = &UserProfileResponse{
 		UserBasicInfo: userPageData.BasicInfo,
 		Interactions:  userPageData.Interactions,
 	}
@@ -176,7 +194,8 @@ func makeUserProfileURL(userID, xsecToken string, tab ProfileTab) string {
 	return url
 }
 
-func (u *UserProfileAction) GetMyProfileViaSidebar(ctx context.Context, tab ProfileTab) (*UserProfileResponse, error) {
+func (u *UserProfileAction) GetMyProfileViaSidebar(ctx context.Context, tab ProfileTab) (response *UserProfileResponse, err error) {
+	defer recoverProfilePanic("load current user profile", &err)
 	page := u.page.Context(ctx).Timeout(60 * time.Second) // 重设被 .Context 清掉的 deadline
 
 	// 创建导航动作
@@ -188,7 +207,9 @@ func (u *UserProfileAction) GetMyProfileViaSidebar(ctx context.Context, tab Prof
 	}
 
 	// 等待页面加载完成并获取 __INITIAL_STATE__
-	page.MustWaitStable()
+	if err := page.WaitStable(time.Second); err != nil {
+		return nil, fmt.Errorf("wait for current profile page: %w", err)
+	}
 
 	if err := u.selectTab(ctx, page, tab); err != nil {
 		return nil, err
@@ -198,7 +219,8 @@ func (u *UserProfileAction) GetMyProfileViaSidebar(ctx context.Context, tab Prof
 }
 
 // selectTab 切到目标子 tab。「笔记」是默认 tab，无需点击。
-func (u *UserProfileAction) selectTab(ctx context.Context, page *rod.Page, tab ProfileTab) error {
+func (u *UserProfileAction) selectTab(ctx context.Context, page *rod.Page, tab ProfileTab) (err error) {
+	defer recoverProfilePanic("select user profile tab", &err)
 	if tab == "" || tab == TabNotes {
 		return nil
 	}
@@ -219,8 +241,46 @@ func (u *UserProfileAction) selectTab(ctx context.Context, page *rod.Page, tab P
 			return fmt.Errorf("切换到 %s 失败: %w", label, err)
 		}
 		humanize.Delay(ctx, humanize.AfterClick)
-		page.MustWaitStable()
+		if err := page.WaitStable(time.Second); err != nil {
+			return fmt.Errorf("等待 %s 页面稳定失败: %w", label, err)
+		}
 		return nil
 	}
 	return fmt.Errorf("未找到子 tab %q", label)
+}
+
+func waitForProfileInitialState(page *rod.Page, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		result, err := page.Eval(`() => typeof window.__INITIAL_STATE__ !== "undefined"`)
+		if err == nil && result != nil && result.Value.Bool() {
+			return nil
+		}
+		if err := waitProfilePoll(page, 250*time.Millisecond); err != nil {
+			return err
+		}
+	}
+	return fmt.Errorf("window.__INITIAL_STATE__ not available after %s", timeout)
+}
+
+func waitProfilePoll(page *rod.Page, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-page.GetContext().Done():
+		return page.GetContext().Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func recoverProfilePanic(operation string, target *error) {
+	if recovered := recover(); recovered != nil {
+		switch cause := recovered.(type) {
+		case error:
+			*target = fmt.Errorf("%s: %w", operation, cause)
+		default:
+			*target = fmt.Errorf("%s: %v", operation, cause)
+		}
+	}
 }

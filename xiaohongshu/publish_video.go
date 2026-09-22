@@ -26,6 +26,9 @@ type PublishVideoContent struct {
 // NewPublishVideoAction 进入发布页并切换到"上传视频"
 func NewPublishVideoAction(page *rod.Page) (*PublishAction, error) {
 	pp := page.Timeout(300 * time.Second)
+	if err := installPublishShadowRootCapture(pp); err != nil {
+		return nil, errors.Wrap(err, "install publish component observer")
+	}
 
 	if err := pp.Navigate(urlOfPublic); err != nil {
 		return nil, errors.Wrap(err, "导航到发布页面失败")

@@ -2,9 +2,11 @@ package xiaohongshu
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -43,6 +45,9 @@ const (
 func NewPublishImageAction(page *rod.Page) (*PublishAction, error) {
 
 	pp := page.Timeout(300 * time.Second)
+	if err := installPublishShadowRootCapture(pp); err != nil {
+		return nil, errors.Wrap(err, "install publish component observer")
+	}
 
 	if err := pp.Navigate(urlOfPublic); err != nil {
 		return nil, errors.Wrap(err, "导航到发布页面失败")
@@ -68,6 +73,36 @@ func NewPublishImageAction(page *rod.Page) (*PublishAction, error) {
 	return &PublishAction{
 		page: pp,
 	}, nil
+}
+
+const publishShadowRootCaptureScript = `(() => {
+  if (window.__xhsGetShadowRoot) return;
+  const roots = new WeakMap();
+  const original = Element.prototype.attachShadow;
+  const wrapped = function(init) {
+    const root = Reflect.apply(original, this, [init]);
+    roots.set(this, root);
+    return root;
+  };
+  Object.defineProperty(Element.prototype, 'attachShadow', {
+    configurable: true,
+    enumerable: false,
+    writable: true,
+    value: wrapped
+  });
+  Object.defineProperty(window, '__xhsGetShadowRoot', {
+    configurable: false,
+    enumerable: false,
+    value: (element) => roots.get(element) || element.shadowRoot || null
+  });
+})();`
+
+// installPublishShadowRootCapture runs before the creator page scripts. The
+// current xhs-publish-btn uses a closed ShadowRoot, so the real submit button
+// is otherwise inaccessible and clicks on the host element are ignored.
+func installPublishShadowRootCapture(page *rod.Page) error {
+	_, err := page.EvalOnNewDocument(publishShadowRootCaptureScript)
+	return err
 }
 
 func (p *PublishAction) Publish(ctx context.Context, content PublishImageContent) error {
@@ -415,16 +450,128 @@ func submitPublish(ctx context.Context, page *rod.Page, title, content string, t
 // （URL 不再含 /publish/publish）。超时仍未跳转 → 判定发布失败。
 func waitPublishSuccess(page *rod.Page, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
+	var lastState publishPageState
 	for {
-		if info, err := page.Info(); err == nil && !strings.Contains(info.URL, "/publish/publish") {
-			slog.Info("发布成功，已跳转离开发布页", "url", info.URL)
+		state, err := readPublishPageState(page)
+		if err == nil {
+			lastState = state
+		}
+		if lastState.URL != "" && !strings.Contains(lastState.URL, "/publish/publish") {
+			slog.Info("发布成功，已跳转离开发布页", "url", lastState.URL)
+			return nil
+		}
+		if lastState.SuccessFeedback {
+			slog.Info("发布成功，已收到平台成功提示")
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return errors.New("发布未确认成功：点击发布后未跳转离开发布页（可能校验未过或被拦截）")
+			// The destructive click already happened. This is not a provider
+			// rejection: the caller must persist unknown and reconcile read-only.
+			diagnosticPath := persistPublishDiagnostic(page, lastState)
+			details := lastState.summary()
+			if diagnosticPath != "" {
+				details += "; diagnostic=" + diagnosticPath
+			}
+			return errors.Errorf("publish_outcome_unknown: 发布未确认成功：点击发布后未跳转离开发布页; %s", details)
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
+}
+
+type publishPageState struct {
+	URL             string   `json:"url"`
+	SubmitDisabled  string   `json:"submit_disabled,omitempty"`
+	SubmitLoading   string   `json:"submit_loading,omitempty"`
+	Feedback        []string `json:"feedback,omitempty"`
+	ClickTrace      []string `json:"click_trace,omitempty"`
+	SuccessFeedback bool     `json:"success_feedback,omitempty"`
+	CapturedAt      string   `json:"captured_at,omitempty"`
+}
+
+func (s publishPageState) summary() string {
+	parts := []string{
+		"url=" + s.URL,
+		"submit_disabled=" + s.SubmitDisabled,
+		"submit_loading=" + s.SubmitLoading,
+	}
+	if len(s.ClickTrace) > 0 {
+		parts = append(parts, "click_trace="+strings.Join(s.ClickTrace, ","))
+	}
+	if len(s.Feedback) > 0 {
+		parts = append(parts, "feedback="+strings.Join(s.Feedback, " | "))
+	}
+	return strings.Join(parts, "; ")
+}
+
+func readPublishPageState(page *rod.Page) (publishPageState, error) {
+	result, err := page.Eval(`() => {
+    const visible = (el) => {
+      if (!el) return false;
+      const style = getComputedStyle(el);
+      const rect = el.getBoundingClientRect();
+      return style.display !== 'none' && style.visibility !== 'hidden' &&
+        Number(style.opacity || 1) !== 0 && rect.width > 0 && rect.height > 0;
+    };
+    const selectors = [
+      '[role="alert"]', '[role="dialog"]',
+      '.d-message', '.d-toast', '.d-notification',
+      '[class*="toast"]', '[class*="message"]', '[class*="error"]',
+      '[class*="modal"]:not(.multi-goods-selector-modal)'
+    ];
+    const feedback = [];
+    const seen = new Set();
+    for (const el of document.querySelectorAll(selectors.join(','))) {
+      if (!visible(el)) continue;
+      const text = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 300);
+      if (!text || seen.has(text)) continue;
+      seen.add(text);
+      feedback.push(text);
+      if (feedback.length >= 8) break;
+    }
+    const host = [...document.querySelectorAll('xhs-publish-btn')]
+      .find(el => visible(el) && el.getAttribute('is-publish') !== 'false');
+    const trace = window.__xhsPublishClickTrace || null;
+    return JSON.stringify({
+      url: location.href,
+      submit_disabled: host ? (host.getAttribute('submit-disabled') || '') : 'host_not_found',
+      submit_loading: host ? (host.getAttribute('submit-loading') || '') : 'host_not_found',
+      feedback,
+      click_trace: trace && Array.isArray(trace.transitions) ? trace.transitions.slice(-12) : [],
+      success_feedback: feedback.some(text => /发布成功|已发布/.test(text))
+    });
+  }`)
+	if err != nil {
+		return publishPageState{}, err
+	}
+	var state publishPageState
+	if err := json.Unmarshal([]byte(result.Value.Str()), &state); err != nil {
+		return publishPageState{}, err
+	}
+	return state, nil
+}
+
+func persistPublishDiagnostic(page *rod.Page, state publishPageState) string {
+	dir := strings.TrimSpace(os.Getenv("XHS_DIAGNOSTICS_DIR"))
+	if dir == "" {
+		if cookiePath := strings.TrimSpace(os.Getenv("COOKIES_PATH")); cookiePath != "" {
+			dir = filepath.Join(filepath.Dir(cookiePath), "diagnostics")
+		}
+	}
+	if dir == "" || os.MkdirAll(dir, 0700) != nil {
+		return ""
+	}
+
+	stamp := time.Now().UTC().Format("20060102T150405.000000000Z")
+	base := filepath.Join(dir, "publish_unknown_"+stamp)
+	state.CapturedAt = time.Now().UTC().Format(time.RFC3339Nano)
+	metadata, marshalErr := json.MarshalIndent(state, "", "  ")
+	if marshalErr == nil {
+		_ = os.WriteFile(base+".json", metadata, 0600)
+	}
+	if screenshot, screenshotErr := page.Screenshot(false, &proto.PageCaptureScreenshot{Format: proto.PageCaptureScreenshotFormatPng}); screenshotErr == nil {
+		_ = os.WriteFile(base+".png", screenshot, 0600)
+	}
+	return base + ".json"
 }
 
 type publishButton struct {
@@ -504,6 +651,13 @@ func findPublishButton(page *rod.Page) (*publishButton, string, error) {
 		if submitDisabled != nil && *submitDisabled == "true" {
 			return &publishButton{elem: widget, isWidget: true}, "新版发布按钮不可点击", nil
 		}
+		submitLoading, err := widget.Attribute("submit-loading")
+		if err != nil {
+			return nil, "", errors.Wrap(err, "读取新版发布按钮 submit-loading 属性失败")
+		}
+		if submitLoading != nil && *submitLoading == "true" {
+			return &publishButton{elem: widget, isWidget: true}, "新版发布按钮正在提交", nil
+		}
 
 		return &publishButton{elem: widget, isWidget: true}, "", nil
 	}
@@ -548,39 +702,80 @@ func clickPublishWidget(page *rod.Page, widget *rod.Element) error {
 	}
 	time.Sleep(200 * time.Millisecond)
 
-	shape, err := widget.Shape()
+	result, err := widget.Eval(`async () => {
+    const host = this;
+    const getRoot = window.__xhsGetShadowRoot;
+    const root = typeof getRoot === 'function' ? getRoot(host) : host.shadowRoot;
+    if (!root) {
+      return JSON.stringify({clicked: false, reason: 'closed_shadow_root_not_captured'});
+    }
+
+    const wanted = (host.getAttribute('submit-text') || '\u53d1\u5e03').trim();
+    const normalize = (value) => (value || '').replace(/\s+/g, ' ').trim();
+    const all = [...root.querySelectorAll('*')];
+    let target = null;
+    for (const node of all) {
+      const label = normalize(node.innerText || node.textContent ||
+        node.getAttribute('aria-label') || node.getAttribute('title'));
+      if (label !== wanted) continue;
+      target = node.closest('button,[role="button"],input[type="button"],input[type="submit"],.d-button') || node;
+      break;
+    }
+    if (!target) {
+      target = root.querySelector(
+        'button[type="submit"], [part*="submit"], [class*="submit"] button, button[class*="submit"]'
+      );
+    }
+    if (!target) {
+      return JSON.stringify({clicked: false, reason: 'inner_submit_button_not_found'});
+    }
+
+    const disabled = !!target.disabled || target.getAttribute('aria-disabled') === 'true' ||
+      target.hasAttribute('disabled') || host.getAttribute('submit-disabled') === 'true';
+    if (disabled) {
+      return JSON.stringify({clicked: false, reason: 'inner_submit_button_disabled'});
+    }
+
+    const trace = {transitions: []};
+    const record = () => trace.transitions.push(
+      'disabled=' + (host.getAttribute('submit-disabled') || '') +
+      ',loading=' + (host.getAttribute('submit-loading') || '')
+    );
+    record();
+    const observer = new MutationObserver(record);
+    observer.observe(host, {attributes: true, attributeFilter: ['submit-disabled', 'submit-loading']});
+    window.__xhsPublishClickTrace = trace;
+    setTimeout(() => observer.disconnect(), 30000);
+
+    target.scrollIntoView({block: 'center', inline: 'center'});
+    if (typeof target.focus === 'function') target.focus({preventScroll: true});
+    // Click the real button inside the captured closed ShadowRoot. Clicking
+    // the xhs-publish-btn host or its screen coordinates is ignored.
+    HTMLElement.prototype.click.call(target);
+    await new Promise(resolve => setTimeout(resolve, 250));
+    record();
+    return JSON.stringify({
+      clicked: true,
+      method: 'closed_shadow_inner_button',
+      transitions: trace.transitions
+    });
+  }`)
 	if err != nil {
-		return errors.Wrap(err, "获取新版发布按钮位置失败")
+		return errors.Wrap(err, "点击新版发布组件内部按钮失败")
 	}
-	if len(shape.Quads) == 0 {
-		return errors.New("获取新版发布按钮位置失败: 无可点击区域")
+	var clickResult struct {
+		Clicked     bool     `json:"clicked"`
+		Method      string   `json:"method"`
+		Reason      string   `json:"reason"`
+		Transitions []string `json:"transitions"`
 	}
-
-	quad := shape.Quads[0]
-	minX, maxX := quad[0], quad[0]
-	minY, maxY := quad[1], quad[1]
-	for i := 0; i < quad.Len(); i++ {
-		x := quad[i*2]
-		y := quad[i*2+1]
-		if x < minX {
-			minX = x
-		}
-		if x > maxX {
-			maxX = x
-		}
-		if y < minY {
-			minY = y
-		}
-		if y > maxY {
-			maxY = y
-		}
+	if err := json.Unmarshal([]byte(result.Value.Str()), &clickResult); err != nil {
+		return errors.Wrap(err, "解析新版发布按钮点击结果失败")
 	}
-
-	x := minX + (maxX-minX)*0.65
-	y := minY + (maxY-minY)/2
-	if err := humanize.ClickAt(page, proto.Point{X: x, Y: y}); err != nil {
-		return errors.Wrap(err, "点击新版发布按钮失败")
+	if !clickResult.Clicked {
+		return errors.Errorf("点击新版发布按钮失败（未触发提交）: %s", clickResult.Reason)
 	}
+	slog.Info("已点击新版发布组件内部真实按钮", "method", clickResult.Method, "trace", clickResult.Transitions)
 	return nil
 }
 

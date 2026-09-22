@@ -1,12 +1,24 @@
 package xiaohongshu
 
 import (
+	"context"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func profilePanicAsError() (err error) {
+	defer recoverProfilePanic("test profile", &err)
+	panic(context.DeadlineExceeded)
+}
+
+func TestRecoverProfilePanicPreservesCause(t *testing.T) {
+	err := profilePanicAsError()
+	require.Error(t, err)
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+}
 
 func TestParseProfileTab(t *testing.T) {
 	cases := []struct {
